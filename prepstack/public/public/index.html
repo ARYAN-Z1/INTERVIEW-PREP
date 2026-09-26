@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>PrepStack — AI Service-to-Product Accelerator</title>
+<title>PrepStack — AI Technical Interview Accelerator</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -50,14 +50,23 @@ const firebaseConfig = {
   measurementId: "G-KCG9ZR9GE5"
 };
 
-if (!firebase.apps.length) {
-  firebase.initializeApp(firebaseConfig);
+try {
+  if (!firebase.apps.length) {
+    firebase.initializeApp(firebaseConfig);
+  }
+} catch (e) {
+  console.warn("Firebase running in local/fallback mode:", e);
 }
-const auth = firebase.auth();
-const db = firebase.firestore();
-const GEMINI_API_KEY = "AQ.Ab8RN6ISPNqXPVR_0qQzhX8Vk_lyWkWQIwsAde8kn3BL11DYCA";
+const auth = typeof firebase !== "undefined" && firebase.auth ? firebase.auth() : null;
+const db = typeof firebase !== "undefined" && firebase.firestore ? firebase.firestore() : null;
 
-/* ---------- Bulletproof Type Normalizers ---------- */
+// Default Gemini API key with localStorage override
+const DEFAULT_GEMINI_KEY = "AQ.Ab8RN6ISPNqXPVR_0qQzhX8Vk_lyWkWQIwsAde8kn3BL11DYCA";
+function getActiveGeminiKey() {
+  return localStorage.getItem("prepstack_custom_gemini_key") || DEFAULT_GEMINI_KEY;
+}
+
+/* ---------- Resilient Parser & Type Normalizers ---------- */
 function safeArray(val, fallback = []) {
   if (Array.isArray(val)) return val.filter(Boolean);
   if (typeof val === 'string' && val.trim().length > 0) {
@@ -68,11 +77,38 @@ function safeArray(val, fallback = []) {
 
 function cleanJsonParse(text) {
   if (!text) return null;
-  let cleaned = String(text).trim();
-  if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  let str = String(text).trim();
+
+  // Strip markdown code fences if present
+  const fenceMatch = str.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch && fenceMatch) {
+    str = fenceMatch.trim();
+  } else {
+    const firstSquare = str.indexOf('[');
+    const firstCurly = str.indexOf('{');
+    let startIdx = -1;
+    if (firstSquare !== -1 && firstCurly !== -1) startIdx = Math.min(firstSquare, firstCurly);
+    else if (firstSquare !== -1) startIdx = firstSquare;
+    else if (firstCurly !== -1) startIdx = firstCurly;
+
+    const lastSquare = str.lastIndexOf(']');
+    const lastCurly = str.lastIndexOf('}');
+    const endIdx = Math.max(lastSquare, lastCurly);
+
+    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+      str = str.substring(startIdx, endIdx + 1);
+    }
   }
-  return JSON.parse(cleaned);
+
+  // Remove trailing commas before closing braces/brackets
+  str = str.replace(/,\s*([\]}])/g, '$1');
+
+  try {
+    return JSON.parse(str);
+  } catch (err) {
+    const sanitized = str.replace(/[\x00-\x1F\x7F-\x9F]/g, "");
+    return JSON.parse(sanitized);
+  }
 }
 
 function getTodayString() {
@@ -82,17 +118,17 @@ function getTodayString() {
 
 function normalizeAnalysis(raw) {
   if (!raw || typeof raw !== 'object') raw = {};
-  const extractedTechs = safeArray(raw.detectedTechs || raw.technologies, ["Java", "Docker", "Python"]);
+  const extractedTechs = safeArray(raw.detectedTechs || raw.technologies, ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL"]);
   return {
-    name: raw.name || "Candidate",
+    name: raw.name || "Aryan Mani",
     track: raw.track || "tech",
-    currentRole: raw.currentRole || raw.current || "Senior Engineer",
+    currentRole: raw.currentRole || raw.current || "Software Engineer",
     targetRole: raw.targetRole || raw.target || "Staff Engineer (Tier-1 Product)",
     primaryTech: raw.primaryTech || extractedTechs[0] || "Java",
-    detectedTechs: extractedTechs.length > 0 ? extractedTechs : ["Java", "Docker", "Python"],
-    readinessScore: Number(raw.readinessScore) || 64,
+    detectedTechs: extractedTechs.length > 0 ? extractedTechs : ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL"],
+    readinessScore: Number(raw.readinessScore) || 68,
     timeline: raw.timeline || "60 Days Standard",
-    highlightedBullet: raw.highlightedBullet || raw.bullet || "Optimized architecture and system throughput across core services.",
+    highlightedBullet: raw.highlightedBullet || raw.bullet || "Engineered distributed Java microservices and optimized high-throughput payment pipelines.",
     missingSkills: safeArray(raw.missingSkills || raw.missing, [
       "Distributed Caching & Sharding",
       "High-Throughput Partitioning",
@@ -108,25 +144,29 @@ function normalizeAnalysis(raw) {
 
 /* ---------- Resilient Gemini AI Caller ---------- */
 async function callGemini(contents, systemInstruction = "", expectJson = false) {
-  const url = "[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=)" + encodeURIComponent(GEMINI_API_KEY);
+  const apiKey = getActiveGeminiKey();
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`;
+  
   const body = {
     contents: contents,
     generationConfig: {
-      temperature: 0.25,
+      temperature: 0.2,
       responseMimeType: expectJson ? "application/json" : "text/plain"
     }
   };
   if (systemInstruction) {
     body.systemInstruction = { parts: [{ text: systemInstruction }] };
   }
+
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
+
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error("Gemini error: " + response.status + " - " + errText);
+    throw new Error(`Gemini API HTTP ${response.status}: ${errText}`);
   }
   const data = await response.json();
   const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -155,6 +195,10 @@ const RefreshCwIcon = p => <Icon {...p} d={<><path d="M21 2v6h-6"/><path d="M3 1
 const PlusIcon = p => <Icon {...p} d={<><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></>} />;
 const UserIcon = p => <Icon {...p} d={<><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></>} />;
 const LogOutIcon = p => <Icon {...p} d={<><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></>} />;
+const KeyIcon = p => <Icon {...p} d={<><path d="M21 2l-2 2m-1.5 1.5l-3 3-2-2-4 4 2 2-3 3H3v-4.5l8.5-8.5 2 2 3-3-2-2L19 1l2 1z"/></>} />;
+const BookmarkIcon = p => <Icon {...p} d={<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>} />;
+const CopyIcon = p => <Icon {...p} d={<><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></>} />;
+const ClockIcon = p => <Icon {...p} d={<><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>} />;
 
 /* ---------- Default Pre-Calibrated Personas ---------- */
 const DEFAULT_PERSONAS = [
@@ -162,10 +206,10 @@ const DEFAULT_PERSONAS = [
     name: "Full-Stack & Cloud Engineer",
     track: "tech",
     primary: "Java",
-    detectedTechs: ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL"],
-    current: "Senior Systems Engineer (TCS)",
-    target: "Staff Software Engineer (Google / Uber)",
-    bullet: "Optimized REST API response times by 35% across legacy microservices monolith.",
+    detectedTechs: ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL", "React.js"],
+    current: "Software Engineer (TCS BaNCS)",
+    target: "Staff Software Engineer (Tier-1 Product)",
+    bullet: "Engineered scalable Java microservices and optimized high-throughput payment pipelines.",
     missing: ["Kafka Partition Topologies", "Redis Caching Strategies", "gRPC / Protobuf", "Distributed Tracing"],
     fluff: ["Legacy SOAP references", "Maintained 150+ tickets", "Generic Waterfall process"]
   },
@@ -173,10 +217,10 @@ const DEFAULT_PERSONAS = [
     name: "Platform & DevOps Engineer",
     track: "tech",
     primary: "Docker",
-    detectedTechs: ["Docker", "Kubernetes", "Python", "Terraform", "AWS"],
+    detectedTechs: ["Docker", "Kubernetes", "Python", "Terraform", "AWS", "CI/CD"],
     current: "Senior DevOps Specialist (Wipro)",
     target: "Staff SRE / Platform Engineer (Atlassian)",
-    bullet: "Engineered automated container orchestration clusters reducing deployment rollback rate by 40%.",
+    bullet: "Engineered automated container clusters reducing deployment rollback rate by 40%.",
     missing: ["eBPF Tracing (Cilium)", "Terraform Drift Automation", "Multi-Region Failover", "Chaos Engineering"],
     fluff: ["Manual VM provisioning", "Maintained Jenkins plugins", "Weekly ticket reporting"]
   },
@@ -187,7 +231,7 @@ const DEFAULT_PERSONAS = [
     detectedTechs: ["Product Strategy", "A/B Testing", "SQL", "User Research", "Agile"],
     current: "Product Owner / Business Analyst (Infosys)",
     target: "Senior Product Manager (Stripe / Airbnb)",
-    bullet: "Spearheaded user onboarding redesign boosting 30-day customer retention by 28% across 450K MAUs.",
+    bullet: "Spearheaded user onboarding redesign boosting 30-day retention by 28% across 450K MAUs.",
     missing: ["Statistical Experimentation at Scale", "SQL Cohort Retention Modeling", "GTM Pricing Strategy", "RICE Prioritization"],
     fluff: ["Managed daily standups", "Wrote JIRA user stories", "Maintained Confluence notes"]
   }
@@ -195,34 +239,141 @@ const DEFAULT_PERSONAS = [
 
 const HEAT_COLORS = ["bg-slate-800/40", "bg-emerald-950", "bg-emerald-800", "bg-emerald-600", "bg-emerald-400"];
 
-/* ---------- Fallback Quiz Generator ---------- */
+/* ---------- FULL 10-QUESTION PRODUCTION FALLBACK SUITE ---------- */
 function generateFallbackQuiz(tech, difficulty, round = 1) {
+  const t = tech || "Technology";
+  const d = (difficulty || "Medium").toUpperCase();
+  
   return [
     {
       id: 1,
-      q: `[${difficulty.toUpperCase()} • Round ${round}] In ${tech}, what is the critical architectural trade-off when optimizing for high-throughput distributed processing?`,
+      q: `[${d} • Q1] In ${t}, what is the critical architectural trade-off when optimizing for high-throughput distributed processing?`,
       options: [
         "Synchronous blocking calls ensure highest throughput",
-        "Asynchronous event-driven decoupling with bounded queues prevents cascading thread starvation under spikes",
-        "Disabling database indexes improves query throughput",
-        "Storing all state in local heap memory without replication"
+        "Asynchronous event-driven decoupling with bounded queues prevents cascading thread starvation under traffic spikes",
+        "Disabling database indexes improves concurrent query throughput",
+        "Storing all shared state in local process heap without replication"
       ],
       correct: 1,
-      explanation: "At high scale, asynchronous non-blocking I/O combined with backpressure prevents worker thread pool exhaustion when downstream dependencies slow down.",
-      code: `// Key Resilience Pattern:\nThroughput = (DecoupledMessageQueues) * (NonBlockingIO)`
+      explanation: "At high scale, asynchronous non-blocking I/O combined with backpressure prevents worker thread pool exhaustion when downstream dependencies encounter latency spikes.",
+      code: `// Decoupled Event Pipeline Architecture:\nClient -> Ingress -> [Kafka/RabbitMQ Buffer] -> Worker Pool -> Datastore`
     },
     {
       id: 2,
-      q: `[${difficulty.toUpperCase()} • Round ${round}] How should data consistency be maintained in ${tech} across microservice boundaries?`,
+      q: `[${d} • Q2] How should data consistency across microservices utilizing ${t} be maintained without degrading availability?`,
       options: [
-        "Two-Phase Commit (2PC) distributed locks across all web services",
-        "The Saga Pattern with compensating transactions and idempotency keys",
-        "Shared database tables accessed simultaneously by all services",
-        "Ignoring failed transactions"
+        "Two-Phase Commit (2PC) distributed locks across all web service endpoints",
+        "The Saga Pattern with compensating transactions and idempotent event consumers",
+        "Shared monolithic database tables accessed simultaneously by all services",
+        "Silently discarding failed transactions without retry queues"
       ],
       correct: 1,
-      explanation: "Distributed 2PC locks degrade availability (CAP theorem). The Saga pattern uses compensating actions and idempotent consumers to achieve eventual consistency.",
-      code: `// Saga Flow:\nExecute(Order) -> Publish(OrderCreated) -> If Fail -> Compensate(RollbackOrder)`
+      explanation: "Distributed 2PC locks degrade availability per the CAP theorem. The Saga pattern executes a sequence of local transactions, relying on compensating actions and idempotent consumers for eventual consistency.",
+      code: `// Saga Orchestration:\nExecute(Order) -> Publish(OrderCreated) -> If Failure -> Trigger(CompensateOrder)`
+    },
+    {
+      id: 3,
+      q: `[${d} • Q3] When implementing a distributed caching layer alongside ${t}, how do you resolve the Cache Stampede (Thundering Herd) problem?`,
+      options: [
+        "Set TTL to 0 for all cached items so they re-fetch immediately",
+        "Use mutex locks (probabilistic early expiration / single-flight cache recomputation)",
+        "Disable distributed caching and route all queries to the primary database",
+        "Flush the entire cache every minute"
+      ],
+      correct: 1,
+      explanation: "A cache stampede occurs when high-concurrency requests encounter a hot key expiration simultaneously. Using distributed locks or single-flight coalescing ensures only one worker computes the value while others wait.",
+      code: `// Mutex / Single-Flight Pattern:\nval, err := singleFlightGroup.Do(key, func() { return fetchFromDB(key) })`
+    },
+    {
+      id: 4,
+      q: `[${d} • Q4] What is the primary operational advantage of implementing Idempotency Keys in ${t} payment or mutating endpoints?`,
+      options: [
+        "Encrypting sensitive user passwords during transmission",
+        "Guaranteeing that network retries or duplicate client submissions do not execute duplicate state changes",
+        "Enforcing strict database table column typing",
+        "Accelerating HTTP compression ratios"
+      ],
+      correct: 1,
+      explanation: "Network timeouts often leave clients uncertain if a mutation completed. Idempotency keys allow safe client retries by storing request hashes and caching previous transaction results.",
+      code: `// Idempotency Middleware:\nIF EXISTS(redis.get(idempotencyKey)) RETURN cachedResponse;\nELSE executeAndStore(idempotencyKey, response);`
+    },
+    {
+      id: 5,
+      q: `[${d} • Q5] When profiling p99 latency in ${t}, what is the root cause of tail latency amplification in distributed topologies?`,
+      options: [
+        "Fast network switches dropping packets uniformly",
+        "Fan-out queries waiting on the slowest dependency (straggler effect) compounded across microservice hops",
+        "Having fewer client connections than server threads",
+        "Overly large static HTML files"
+      ],
+      correct: 1,
+      explanation: "In architectures where a single request fans out to N backend services in parallel, the overall request latency is bounded by max(L1, L2, ... LN). A 1% latency tail makes high latency almost certain with 100 parallel hops.",
+      code: `// Overall Request Latency:\nLatency(Req) = MAX(ServiceA, ServiceB, ServiceC, ... ServiceN)`
+    },
+    {
+      id: 6,
+      q: `[${d} • Q6] In ${t}, which database isolation level prevents Non-Repeatable Reads while still allowing Phantom Reads under standard ANSI SQL?`,
+      options: [
+        "Read Uncommitted",
+        "Read Committed",
+        "Repeatable Read",
+        "Serializable"
+      ],
+      correct: 2,
+      explanation: "Repeatable Read ensures that any data read during a transaction cannot be modified by concurrent transactions, preventing non-repeatable reads. Phantom reads are only fully prevented by Serializable isolation or MVCC range locks.",
+      code: `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;\nBEGIN TRANSACTION; -- Snapshot isolation guarantees consistent reads`
+    },
+    {
+      id: 7,
+      q: `[${d} • Q7] How does a Circuit Breaker pattern protect ${t} microservices during downstream service failure?`,
+      options: [
+        "Forces CPU frequency throttling to save server power",
+        "Trips to OPEN state after a threshold of failures, failing fast without consuming threads or sockets",
+        "Restarts the entire operating system kernel automatically",
+        "Converts all HTTP methods into GET requests"
+      ],
+      correct: 1,
+      explanation: "When a dependency slows down or fails, upstream callers can exhaust connection pools waiting for timeouts. A circuit breaker trips open, returning instant fallbacks until a health check passes.",
+      code: `// Circuit Breaker State Machine:\nCLOSED (Normal) -> Failure Rate > Threshold -> OPEN (Fail Fast) -> Timeout -> HALF-OPEN`
+    },
+    {
+      id: 8,
+      q: `[${d} • Q8] What mechanism in ${t} provides horizontal scalability while avoiding single-node database hotspots for distributed datasets?`,
+      options: [
+        "Consistent Hashing with virtual nodes for partition distribution",
+        "Storing all records alphabetically in a single flat file",
+        "Master-slave replication without sharding or partitioning",
+        "Assigning all keys to index 0"
+      ],
+      correct: 0,
+      explanation: "Consistent hashing minimizes key redistribution when cluster nodes are added or removed (only K/N keys moved) and virtual nodes smooth out hash distribution skew.",
+      code: `// Hash Ring Mapping:\nNodePosition = Hash(NodeID); KeyPosition = Hash(KeyID);\nAssignToNextClockwiseNode(KeyPosition);`
+    },
+    {
+      id: 9,
+      q: `[${d} • Q9] When instrumenting ${t} microservices for modern production observability, what are the Three Pillars of Observability?`,
+      options: [
+        "HTML, CSS, and JavaScript",
+        "Metrics, Distributed Traces, and Structured Logs",
+        "Unit tests, Integration tests, and End-to-End tests",
+        "CPU, RAM, and Disk Space"
+      ],
+      correct: 1,
+      explanation: "Metrics provide aggregations over time; structured logs provide detailed contextual events; distributed traces connect causality across network boundaries via span IDs.",
+      code: `// OpenTelemetry Context Propagation:\nW3C Traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`
+    },
+    {
+      id: 10,
+      q: `[${d} • Q10] Under high concurrency in ${t}, how does Optimistic Concurrency Control (OCC) differ from Pessimistic Locking?`,
+      options: [
+        "OCC locks the entire database table for the duration of the user session",
+        "OCC verifies version timestamps or record hashes at commit time, aborting or retrying if conflicting writes occurred without locking rows beforehand",
+        "Pessimistic locking does not require database support",
+        "OCC only works with static read-only files"
+      ],
+      correct: 1,
+      explanation: "Pessimistic locking takes explicit row/table locks (SELECT ... FOR UPDATE), causing contention under high read/write ratio. OCC allows concurrent reads and writes, checking version increments at commit time.",
+      code: `// OCC Update Query:\nUPDATE accounts SET balance = balance - 100, version = version + 1\nWHERE id = 42 AND version = 5; -- Affected rows = 0 indicates conflict`
     }
   ];
 }
@@ -247,13 +398,13 @@ class ErrorBoundary extends Component {
             <div className="w-12 h-12 rounded-full bg-cyan-950 border border-cyan-800 flex items-center justify-center mx-auto text-cyan-400">
               <SparklesIcon className="w-6 h-6"/>
             </div>
-            <h2 className="text-lg font-bold text-white">Workspace Initialized</h2>
-            <p className="text-xs text-slate-400">Click below to load your personalized interview dashboard.</p>
+            <h2 className="text-lg font-bold text-white">Workspace Ready</h2>
+            <p className="text-xs text-slate-400">Click below to return to your personalized dashboard.</p>
             <button
               onClick={() => { this.setState({ hasError: false }); window.location.reload(); }}
               className="px-5 py-2.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold rounded-xl"
             >
-              Open Dashboard
+              Reload Dashboard
             </button>
           </div>
         </div>
@@ -264,24 +415,26 @@ class ErrorBoundary extends Component {
 }
 
 /* ---------- 2. Resume Parser & Questionnaire ---------- */
-function Onboarding({ onComplete }) {
+function Onboarding({ onComplete, onOpenApiKeyModal }) {
   const [step, setStep] = useState("upload");
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
+  const [inputTab, setInputTab] = useState("file");
+  const [resumeText, setResumeText] = useState("");
   const fileInputRef = useRef(null);
 
   const [candidateProfile, setCandidateProfile] = useState({
-    name: "Candidate",
+    name: "Aryan Mani",
     track: "tech",
-    currentRole: "Senior Engineer",
+    currentRole: "Software Engineer (TCS BaNCS)",
     primarySkill: "Java",
-    detectedTechs: ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL"],
-    highlightedBullet: "",
+    detectedTechs: ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL", "React.js"],
+    highlightedBullet: "Engineered scalable Java microservices and ISO 20022 pipelines for Tier-1 banks.",
     rawSummary: ""
   });
 
   const [targetRole, setTargetRole] = useState("Staff Software Engineer (Tier-1 Product)");
-  const [techList, setTechList] = useState(["Java", "Docker", "Python"]);
+  const [techList, setTechList] = useState(["Java", "Docker", "Python", "Kubernetes", "PostgreSQL"]);
   const [newTechInput, setNewTechInput] = useState("");
   const [timeline, setTimeline] = useState("60 Days Standard");
 
@@ -294,7 +447,11 @@ function Onboarding({ onComplete }) {
       if (isFile) {
         const base64Data = await new Promise((resolve, reject) => {
           const reader = new FileReader();
-          reader.onload = () => resolve(reader.result.split(','));
+          reader.onload = () => {
+            const res = reader.result;
+            const idx = res.indexOf(',');
+            resolve(idx !== -1 ? res.slice(idx + 1) : res);
+          };
           reader.onerror = reject;
           reader.readAsDataURL(fileOrText);
         });
@@ -317,23 +474,24 @@ Return pure JSON with:
 }`
       });
 
-      const parsed = await callGemini([{ parts }], "You are a career intelligence engine. Output valid JSON only.", true);
-      const extractedTechs = safeArray(parsed.detectedTechs, ["Java", "Docker", "Python"]);
+      const parsed = await callGemini([{ parts }], "You are an expert career intelligence engine. Output valid JSON only.", true);
+      const extractedTechs = safeArray(parsed?.detectedTechs, ["Java", "Docker", "Python", "Kubernetes", "PostgreSQL"]);
 
       setCandidateProfile({
-        name: parsed.name || "Candidate",
-        track: parsed.track || "tech",
-        currentRole: parsed.currentRole || "Senior Systems Engineer",
-        primarySkill: parsed.primarySkillOrDomain || extractedTechs[0] || "Java",
+        name: parsed?.name || "Aryan Mani",
+        track: parsed?.track || "tech",
+        currentRole: parsed?.currentRole || "Senior Systems Engineer",
+        primarySkill: parsed?.primarySkillOrDomain || extractedTechs[0] || "Java",
         detectedTechs: extractedTechs,
-        highlightedBullet: parsed.highlightedBullet || "Optimized infrastructure and workflow pipelines.",
+        highlightedBullet: parsed?.highlightedBullet || "Optimized infrastructure and distributed workflow pipelines.",
         rawSummary: extractedTechs.join(", ")
       });
 
       setTechList(extractedTechs);
-      setTargetRole(parsed.track === "non-tech" ? "Senior Product Manager (Tier-1)" : "Staff Software Engineer (Tier-1)");
+      setTargetRole(parsed?.track === "non-tech" ? "Senior Product Manager (Tier-1)" : "Staff Software Engineer (Tier-1)");
       setStep("questionnaire");
     } catch (err) {
+      console.warn("Resume parsing fallback activated:", err);
       loadPreset(DEFAULT_PERSONAS[0]);
     } finally {
       setLoading(false);
@@ -342,7 +500,7 @@ Return pure JSON with:
 
   const loadPreset = (preset) => {
     setCandidateProfile({
-      name: "Rahul Sharma",
+      name: "Aryan Mani",
       track: preset.track,
       currentRole: preset.current,
       primarySkill: preset.primary,
@@ -369,7 +527,7 @@ Return pure JSON with:
 
   const handleGenerateFinalWorkspace = async () => {
     setStep("generating");
-    setStatusMsg("Building individualized quiz hubs and roadmap for " + techList.join(", ") + "...");
+    setStatusMsg("Building individualized 10-question quiz tracks for " + techList.join(", ") + "...");
 
     try {
       const workspacePayload = await callGemini([
@@ -399,7 +557,7 @@ Return pure JSON matching:
       }));
     } catch (e) {
       onComplete(normalizeAnalysis({
-        readinessScore: 64,
+        readinessScore: 68,
         primaryTech: techList[0] || "Java",
         detectedTechs: techList,
         targetRole: targetRole,
@@ -423,36 +581,73 @@ Return pure JSON matching:
             </div>
             <h1 className="text-3xl font-extrabold text-white tracking-tight">Upload Resume & Extract All Tech</h1>
             <p className="text-slate-400 text-xs md:text-sm mt-1">
-              Gemini scans your entire profile and creates dedicated quiz tracks for <strong>each technology (e.g. Java, Docker, Python)</strong>.
+              Gemini scans your profile and automatically creates dedicated <strong>10-Question Quiz Tracks</strong> for each technology.
             </p>
           </div>
 
-          <input type="file" ref={fileInputRef} onChange={(e) => e.target.files?.[0] && parseResumeFileOrText(e.target.files[0], true)} accept=".pdf,.doc,.docx,.txt" className="hidden" />
+          <div className="flex border border-slate-800 rounded-xl p-1 bg-slate-900/60 max-w-xs mx-auto">
+            <button
+              onClick={() => setInputTab("file")}
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${inputTab === "file" ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40" : "text-slate-400 hover:text-white"}`}
+            >
+              Upload PDF / DOCX
+            </button>
+            <button
+              onClick={() => setInputTab("text")}
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-lg transition-all ${inputTab === "text" ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40" : "text-slate-400 hover:text-white"}`}
+            >
+              Paste Text
+            </button>
+          </div>
 
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            disabled={loading}
-            className="w-full border-2 border-dashed border-slate-700/80 hover:border-cyan-500/60 bg-[#090d18] hover:bg-slate-900/80 rounded-2xl p-8 flex flex-col items-center gap-3 transition-all cursor-pointer shadow-xl"
-          >
-            {!loading ? (
-              <>
-                <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center text-cyan-400 shadow-md">
-                  <UploadIcon className="w-6 h-6"/>
-                </div>
-                <div className="text-sm font-bold text-white">Upload Your Actual Resume (PDF or DOCX)</div>
-                <span className="text-xs text-slate-500">Auto-detects languages, frameworks, cloud tools & domain</span>
-              </>
-            ) : (
-              <div className="py-4 flex flex-col items-center gap-2">
-                <div className="flex gap-1.5">
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot1"/>
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot2"/>
-                  <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot3"/>
-                </div>
-                <span className="text-xs text-cyan-300 font-mono mt-1 text-center">{statusMsg}</span>
-              </div>
-            )}
-          </button>
+          {inputTab === "file" ? (
+            <>
+              <input type="file" ref={fileInputRef} onChange={(e) => e.target.files?.[0] && parseResumeFileOrText(e.target.files[0], true)} accept=".pdf,.doc,.docx,.txt" className="hidden" />
+
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={loading}
+                className="w-full border-2 border-dashed border-slate-700/80 hover:border-cyan-500/60 bg-[#090d18] hover:bg-slate-900/80 rounded-2xl p-8 flex flex-col items-center gap-3 transition-all cursor-pointer shadow-xl"
+              >
+                {!loading ? (
+                  <>
+                    <div className="w-14 h-14 rounded-2xl bg-slate-800 flex items-center justify-center text-cyan-400 shadow-md">
+                      <UploadIcon className="w-6 h-6"/>
+                    </div>
+                    <div className="text-sm font-bold text-white">Upload Your Actual Resume (PDF or DOCX)</div>
+                    <span className="text-xs text-slate-500">Auto-detects languages, frameworks, cloud tools & domain</span>
+                  </>
+                ) : (
+                  <div className="py-4 flex flex-col items-center gap-2">
+                    <div className="flex gap-1.5">
+                      <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot1"/>
+                      <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot2"/>
+                      <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot3"/>
+                    </div>
+                    <span className="text-xs text-cyan-300 font-mono mt-1 text-center">{statusMsg}</span>
+                  </div>
+                )}
+              </button>
+            </>
+          ) : (
+            <div className="border border-slate-800 bg-[#090d18] rounded-2xl p-6 space-y-4">
+              <label className="text-xs font-bold text-slate-300 block">Paste Resume Content or Profile Bio:</label>
+              <textarea
+                value={resumeText}
+                onChange={e => setResumeText(e.target.value)}
+                placeholder="Paste work experience, skills (e.g. Java, Docker, Python, Spring Boot), and key projects..."
+                rows="6"
+                className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+              />
+              <button
+                onClick={() => parseResumeFileOrText(resumeText, false)}
+                disabled={loading || !resumeText.trim()}
+                className="w-full py-2.5 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-xl transition-all disabled:opacity-50"
+              >
+                {loading ? "Parsing Resume..." : "Extract Profile & Setup Quiz Tracks"}
+              </button>
+            </div>
+          )}
 
           <div className="space-y-2 pt-2">
             <div className="text-[11px] font-bold uppercase tracking-wider text-slate-500 text-center font-mono">
@@ -481,7 +676,7 @@ Return pure JSON matching:
               <SlidersIcon className="w-4 h-4"/> Step 2: Auto-Extracted Technologies
             </div>
             <h2 className="text-xl font-bold text-white">Parsed Profile: {candidateProfile.currentRole}</h2>
-            <p className="text-xs text-slate-400 mt-1">We parsed these technologies from your resume. Each will receive its own Easy, Medium, and Hard 10-question quiz track.</p>
+            <p className="text-xs text-slate-400 mt-1">We parsed these technologies. Each will receive its own full 10-Question Practice Lab.</p>
           </div>
 
           <div className="space-y-4 text-xs">
@@ -491,13 +686,13 @@ Return pure JSON matching:
                 type="text"
                 value={targetRole}
                 onChange={e => setTargetRole(e.target.value)}
-                placeholder="e.g. Staff Software Engineer (Google / Uber)"
+                placeholder="e.g. Staff Software Engineer (Tier-1 Product)"
                 className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-cyan-500"
               />
             </div>
 
             <div>
-              <label className="font-bold text-slate-300 block mb-1.5">2. Technologies Extracted from Resume (Independent Quiz Tracks)</label>
+              <label className="font-bold text-slate-300 block mb-1.5">2. Technologies Extracted from Resume (Independent 10-Q Tracks)</label>
               <div className="flex flex-wrap gap-1.5 mb-2">
                 {techList.map((t) => (
                   <span key={t} className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-cyan-950 text-cyan-200 border border-cyan-800 font-mono text-xs">
@@ -512,7 +707,7 @@ Return pure JSON matching:
                   value={newTechInput}
                   onChange={e => setNewTechInput(e.target.value)}
                   onKeyDown={e => e.key === "Enter" && addTechTag()}
-                  placeholder="Add another technology (e.g. Docker, Python, Kafka)..."
+                  placeholder="Add another technology (e.g. Kafka, Redis, AWS)..."
                   className="flex-1 bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-500"
                 />
                 <button onClick={addTechTag} className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-bold rounded-xl border border-slate-700 text-slate-200">
@@ -565,12 +760,12 @@ Return pure JSON matching:
   );
 }
 
-/* ---------- Shared Sidebar Shell with Authentication ---------- */
-function Shell({ active, setView, onReplay, analysis, user, onSignIn, onSignOut, children }) {
+/* ---------- Shared Sidebar Shell ---------- */
+function Shell({ active, setView, onReplay, analysis, user, onSignIn, onSignOut, onOpenApiKeyModal, children }) {
   const norm = normalizeAnalysis(analysis);
   const items = [
     {id:"dashboard", label:"Command Center", Icon:GridIcon},
-    {id:"practice", label:"Practice Labs", Icon:BookOpenIcon, badge: `${norm.detectedTechs.length} Techs`},
+    {id:"practice", label:"Practice Labs", Icon:BookOpenIcon, badge: `${norm.detectedTechs.length} Tracks`},
     {id:"star", label:"STAR Story Studio", Icon:AwardIcon, badge:"Behavioral"},
     {id:"defender", label:"Resume Defender", Icon:ShieldIcon},
     {id:"commute", label:"Commute Mode", Icon:MicIcon},
@@ -610,16 +805,28 @@ function Shell({ active, setView, onReplay, analysis, user, onSignIn, onSignOut,
           ))}
         </nav>
 
-        {/* User Account / Cloud Sync Card */}
+        <div className="px-1 mt-4">
+          <button
+            onClick={onOpenApiKeyModal}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-slate-900/80 hover:bg-slate-800 border border-slate-800 text-[11px] text-slate-300 transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <KeyIcon className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Gemini API Key</span>
+            </div>
+            <span className="w-2 h-2 rounded-full bg-emerald-400" />
+          </button>
+        </div>
+
         <div className="mt-auto p-3 rounded-xl bg-slate-900/60 border border-slate-800 text-xs space-y-2">
           {user ? (
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 overflow-hidden">
                 <div className="w-7 h-7 rounded-full bg-gradient-to-tr from-cyan-500 to-emerald-400 text-slate-950 font-bold flex items-center justify-center text-xs shrink-0">
-                  {user.displayName ? user.displayName.charAt(0).toUpperCase() : 'U'}
+                  {user.displayName ? user.displayName.charAt(0).toUpperCase() : 'A'}
                 </div>
                 <div className="overflow-hidden">
-                  <div className="text-xs font-semibold text-white truncate">{user.displayName || 'Developer'}</div>
+                  <div className="text-xs font-semibold text-white truncate">{user.displayName || 'Aryan Mani'}</div>
                   <div className="text-[10px] text-emerald-400 font-mono">Cloud Synced</div>
                 </div>
               </div>
@@ -629,7 +836,7 @@ function Shell({ active, setView, onReplay, analysis, user, onSignIn, onSignOut,
             </div>
           ) : (
             <div className="space-y-1.5">
-              <div className="text-[10px] text-slate-400">Save your streak & scores:</div>
+              <div className="text-[10px] text-slate-400">Save streak & scores:</div>
               <button
                 onClick={onSignIn}
                 className="w-full py-1.5 bg-slate-800 hover:bg-slate-700 text-white font-semibold text-xs rounded-lg border border-slate-700 flex items-center justify-center gap-1.5 transition-colors"
@@ -646,7 +853,7 @@ function Shell({ active, setView, onReplay, analysis, user, onSignIn, onSignOut,
   );
 }
 
-/* ---------- 3. Command Center View (Functional Streak & Score) ---------- */
+/* ---------- 3. Command Center View ---------- */
 function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setView }) {
   const norm = normalizeAnalysis(analysis);
   const pct = readinessScore;
@@ -654,7 +861,6 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
   const circumference = 2 * Math.PI * radius;
   const offset = circumference * (1 - pct / 100);
 
-  // Generate 18 weeks (126 days) backwards from today
   const todayStr = getTodayString();
   const calendarDays = [];
   for (let i = 125; i >= 0; i--) {
@@ -669,7 +875,6 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
     });
   }
 
-  // Reshape into 18 columns of 7 days
   const calendarWeeks = [];
   for (let w = 0; w < 18; w++) {
     calendarWeeks.push(calendarDays.slice(w * 7, (w + 1) * 7));
@@ -686,11 +891,10 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
             {norm.targetRole}
           </span>
         </div>
-        <p className="text-slate-400 text-xs mt-0.5">Your live readiness score and streak update automatically as you complete drills.</p>
+        <p className="text-slate-400 text-xs mt-0.5">Live interview readiness metrics calculated across deliberate practice sessions.</p>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
-        {/* Functional Readiness Score Gauge */}
         <div className="md:col-span-5 border border-slate-800 bg-[#090d18] rounded-2xl p-5 flex items-center gap-4">
           <div className="relative flex items-center justify-center shrink-0">
             <svg width="74" height="74" className="-rotate-90">
@@ -715,12 +919,11 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
               <span className="text-xs font-bold text-white">Live Readiness Score</span>
               <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">Reactive</span>
             </div>
-            <div className="text-[11px] text-slate-400">Target baseline: <strong className="text-slate-200">85+ Benchmark</strong></div>
-            <div className="text-[10px] text-cyan-400 font-medium">Increases as you finish MCQs & Defense drills</div>
+            <div className="text-[11px] text-slate-400">Target benchmark: <strong className="text-slate-200">85+ Benchmark</strong></div>
+            <div className="text-[10px] text-cyan-400 font-medium">Increases as you finish 10-Q MCQs & Defense drills</div>
           </div>
         </div>
 
-        {/* Functional Date-Accurate Heatmap */}
         <div className="md:col-span-7 border border-slate-800 bg-[#090d18] rounded-2xl p-5 flex flex-col justify-between">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
@@ -766,7 +969,6 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
         </div>
       </div>
 
-      {/* Dynamic Gap Analysis Card */}
       <div className="border border-slate-800 bg-[#090d18] rounded-2xl p-5 space-y-3.5">
         <div className="flex items-center justify-between border-b border-slate-800/80 pb-3">
           <div>
@@ -807,18 +1009,17 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
         </div>
       </div>
 
-      {/* 4 Feature Launch Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-3.5">
         <div className="border border-slate-800 bg-[#090d18] rounded-2xl p-4 flex flex-col justify-between hover:border-cyan-500/40 transition-colors">
           <div>
             <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-400 bg-cyan-950/60 border border-cyan-800/60 px-2 py-0.5 rounded">
-              +3 to +6 Score
+              +4 to +6 Score
             </span>
-            <div className="text-sm font-bold text-white mt-2">Practice Labs</div>
-            <p className="text-xs text-slate-400 mt-1">Dedicated tracks for {norm.detectedTechs.slice(0, 3).join(", ")}.</p>
+            <div className="text-sm font-bold text-white mt-2">Practice Labs (10 Qs)</div>
+            <p className="text-xs text-slate-400 mt-1">Full 10-Question sets for {norm.detectedTechs.slice(0, 3).join(", ")}.</p>
           </div>
           <button onClick={() => setView("practice")} className="mt-3 w-full py-2 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs rounded-xl transition-all flex items-center justify-center gap-1.5">
-            Start Practice Labs <ArrowIcon className="w-3.5 h-3.5"/>
+            Start 10-Q Lab <ArrowIcon className="w-3.5 h-3.5"/>
           </button>
         </div>
 
@@ -854,7 +1055,7 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
               +3 Score
             </span>
             <div className="text-sm font-bold text-white mt-2">Commute Mode</div>
-            <p className="text-xs text-slate-400 mt-1">Verbal scenario drills with filler-word scoring.</p>
+            <p className="text-xs text-slate-400 mt-1">Verbal scenario drills with speech hygiene analysis.</p>
           </div>
           <button onClick={() => setView("commute")} className="mt-3 w-full py-2 bg-emerald-500 hover:bg-emerald-400 text-xs font-bold text-slate-950 rounded-xl transition-all flex items-center justify-center gap-1.5 shadow-lg shadow-emerald-950/50">
             Start Audio <ArrowIcon className="w-3.5 h-3.5"/>
@@ -865,51 +1066,93 @@ function Dashboard({ analysis, readinessScore, activityLog, currentStreak, setVi
   );
 }
 
-/* ---------- 4. Multi-Tech Practice Lab ---------- */
+/* ---------- 4. Multi-Tech Practice Lab (10-Question Guarantee) ---------- */
 function PracticeMode({ analysis, onCompleteSprint }) {
   const norm = normalizeAnalysis(analysis);
   const [techList, setTechList] = useState(norm.detectedTechs);
   const [selectedTech, setSelectedTech] = useState(norm.detectedTechs[0] || "Java");
-  const [difficulty, setDifficulty] = useState("easy");
+  const [difficulty, setDifficulty] = useState("medium");
   const [round, setRound] = useState(1);
   const [newTech, setNewTech] = useState("");
 
   const [currentIdx, setCurrentIdx] = useState(0);
   const [selectedAnswers, setSelectedAnswers] = useState({});
+  const [flaggedQuestions, setFlaggedQuestions] = useState({});
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [questions, setQuestions] = useState([]);
   const [loadingQs, setLoadingQs] = useState(false);
+  const [secondsRemaining, setSecondsRemaining] = useState(900); // 15 mins
+  const [copiedSummary, setCopiedSummary] = useState(false);
+
+  useEffect(() => {
+    if (isSubmitted || loadingQs) return;
+    const interval = setInterval(() => {
+      setSecondsRemaining(prev => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          handleSubmitQuiz();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isSubmitted, loadingQs]);
 
   useEffect(() => {
     async function loadDynamicQuestions() {
       setLoadingQs(true);
+      setSecondsRemaining(900);
       try {
         const generated = await callGemini([
           {
             parts: [{
-              text: `Generate exactly 10 NEW and UNIQUE multiple-choice interview questions for "${selectedTech}" at difficulty: "${difficulty.toUpperCase()}".
-This is Practice Round #${round}. Ensure these are distinct questions testing practical, deep concepts for Tier-1 Product Companies.
-Return pure JSON array matching:
+              text: `Generate exactly 10 NEW and UNIQUE multiple-choice interview questions for "${selectedTech}" at difficulty level: "${difficulty.toUpperCase()}".
+This is Practice Round #${round}.
+CRITICAL REQUIREMENTS:
+1. Provide an array of EXACTLY 10 distinct questions (no fewer, no more).
+2. Target Staff/Senior Engineer standards at Tier-1 companies (Google, Uber, Stripe).
+3. Return pure JSON array matching:
 [
   {
-    "id": number,
+    "id": number (1 to 10),
     "q": string,
     "options": [string, string, string, string],
-    "correct": number (0 to 3 index),
+    "correct": number (0, 1, 2, or 3),
     "explanation": string,
     "code": string
   }
 ]`
             }]
           }
-        ], "You are a Principal Technical Interviewer. Output only JSON array.", true);
+        ], "You are a Principal Technical Interviewer. Output only JSON array containing exactly 10 questions.", true);
 
-        if (Array.isArray(generated) && generated.length > 0) {
-          setQuestions(generated);
+        if (Array.isArray(generated) && generated.length >= 10) {
+          setQuestions(generated.slice(0, 10));
+        } else if (Array.isArray(generated) && generated.length > 0) {
+          const fallbacks = generateFallbackQuiz(selectedTech, difficulty, round);
+          const merged = [...generated];
+          for (let i = generated.length; i < 10; i++) {
+            merged.push(fallbacks[i] || {
+              id: i + 1,
+              q: `[${difficulty.toUpperCase()} • Q${i+1}] In ${selectedTech}, what is the recommended design strategy for failure isolation?`,
+              options: [
+                "Implement bulkheads and rate-limiting per client tier",
+                "Share single worker pools across all traffic types",
+                "Disable timeout metrics",
+                "Route all requests through single master node"
+              ],
+              correct: 0,
+              explanation: "Bulkheads isolate resources so failure in one tenant or endpoint does not cascade across the entire cluster.",
+              code: `// Bulkhead configuration:\nThreadPoolExecutor pool = new ThreadPoolExecutor(10, 20, ...)`
+            });
+          }
+          setQuestions(merged);
         } else {
           setQuestions(generateFallbackQuiz(selectedTech, difficulty, round));
         }
       } catch (err) {
+        console.warn("Dynamic question generation notice, loading 10-Q fallback suite:", err);
         setQuestions(generateFallbackQuiz(selectedTech, difficulty, round));
       } finally {
         setLoadingQs(false);
@@ -925,6 +1168,10 @@ Return pure JSON array matching:
     setSelectedAnswers({ ...selectedAnswers, [currentIdx]: optionIdx });
   };
 
+  const toggleFlag = (idx) => {
+    setFlaggedQuestions({ ...flaggedQuestions, [idx]: !flaggedQuestions[idx] });
+  };
+
   const handleSubmitQuiz = () => {
     setIsSubmitted(true);
     const scoreVal = questions.reduce((acc, q, idx) => acc + (selectedAnswers[idx] === q.correct ? 1 : 0), 0);
@@ -936,6 +1183,7 @@ Return pure JSON array matching:
     setRound(round + 1);
     setCurrentIdx(0);
     setSelectedAnswers({});
+    setFlaggedQuestions({});
     setIsSubmitted(false);
   };
 
@@ -948,11 +1196,22 @@ Return pure JSON array matching:
       setRound(1);
       setCurrentIdx(0);
       setSelectedAnswers({});
+      setFlaggedQuestions({});
       setIsSubmitted(false);
     }
   };
 
+  const copyResults = () => {
+    const scoreVal = questions.reduce((acc, q, idx) => acc + (selectedAnswers[idx] === q.correct ? 1 : 0), 0);
+    const text = `PrepStack Quiz Results • ${selectedTech} (${difficulty.toUpperCase()})\nScore: ${scoreVal}/10 (${Math.round((scoreVal/10)*100)}%)\nRound #${round} Completed on PrepStack`;
+    navigator.clipboard.writeText(text);
+    setCopiedSummary(true);
+    setTimeout(() => setCopiedSummary(false), 2500);
+  };
+
   const score = questions.reduce((acc, q, idx) => acc + (selectedAnswers[idx] === q.correct ? 1 : 0), 0);
+  const minutes = Math.floor(secondsRemaining / 60);
+  const seconds = secondsRemaining % 60;
 
   return (
     <div className="p-8 max-w-4xl mx-auto space-y-6 rise">
@@ -963,36 +1222,43 @@ Return pure JSON array matching:
               <CodeIcon className="w-5 h-5 text-cyan-400" />
               <h1 className="text-xl font-bold text-white tracking-tight">Practice Lab: {selectedTech}</h1>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300 border border-cyan-800 font-mono">
-                Round #{round}
+                Round #{round} • 10 Questions
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-1">10 Distinct MCQs per batch. Practice again anytime to load 10 brand-new questions.</p>
           </div>
 
-          <div className="flex items-center gap-1.5 p-1 bg-slate-900 border border-slate-800 rounded-xl">
-            {[
-              { id: "easy", label: "Easy", color: "text-emerald-400" },
-              { id: "medium", label: "Medium", color: "text-amber-400" },
-              { id: "hard", label: "Hard", color: "text-rose-400" }
-            ].map(tab => (
-              <button
-                key={tab.id}
-                onClick={() => { setDifficulty(tab.id); setCurrentIdx(0); setSelectedAnswers({}); setIsSubmitted(false); }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                  difficulty === tab.id
-                    ? "bg-slate-800 text-white shadow-sm border border-slate-700/60"
-                    : "text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                <span className={difficulty === tab.id ? tab.color : ""}>{tab.label}</span>
-                <span className="text-[10px] text-slate-500 ml-1 font-mono">(10 Qs)</span>
-              </button>
-            ))}
+          <div className="flex items-center gap-3">
+            {!isSubmitted && (
+              <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 font-mono text-xs text-amber-300">
+                <ClockIcon className="w-3.5 h-3.5 text-amber-400" />
+                <span>{String(minutes).padStart(2, '0')}:{String(seconds).padStart(2, '0')}</span>
+              </div>
+            )}
+            <div className="flex items-center gap-1.5 p-1 bg-slate-900 border border-slate-800 rounded-xl">
+              {[
+                { id: "easy", label: "Easy", color: "text-emerald-400" },
+                { id: "medium", label: "Medium", color: "text-amber-400" },
+                { id: "hard", label: "Hard", color: "text-rose-400" }
+              ].map(tab => (
+                <button
+                  key={tab.id}
+                  onClick={() => { setDifficulty(tab.id); setCurrentIdx(0); setSelectedAnswers({}); setFlaggedQuestions({}); setIsSubmitted(false); }}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    difficulty === tab.id
+                      ? "bg-slate-800 text-white shadow-sm border border-slate-700/60"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <span className={difficulty === tab.id ? tab.color : ""}>{tab.label}</span>
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 pt-2">
-          <span className="text-xs text-slate-500 font-mono mr-1">Select Technology:</span>
+          <span className="text-xs text-slate-500 font-mono mr-1">Select Track:</span>
           {techList.map((tech) => (
             <button
               key={tech}
@@ -1000,6 +1266,7 @@ Return pure JSON array matching:
                 setSelectedTech(tech);
                 setCurrentIdx(0);
                 setSelectedAnswers({});
+                setFlaggedQuestions({});
                 setIsSubmitted(false);
                 setRound(1);
               }}
@@ -1036,24 +1303,67 @@ Return pure JSON array matching:
             <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot2"/>
             <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 dot3"/>
           </div>
-          <span className="text-xs text-cyan-300 font-mono">Formulating 10 fresh {difficulty.toUpperCase()} questions for {selectedTech} (Round #{round})...</span>
+          <span className="text-xs text-cyan-300 font-mono">Generating 10 production-ready {difficulty.toUpperCase()} questions for {selectedTech} (Round #{round})...</span>
         </div>
       ) : !isSubmitted ? (
         <div className="space-y-5">
-          <div className="flex items-center justify-between text-xs text-slate-400">
-            <span className="font-mono">Question <strong className="text-white">{currentIdx + 1}</strong> of {questions.length}</span>
-            <span className="text-[10px] font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-800/60 px-2 py-0.5 rounded uppercase">
-              {selectedTech} • {difficulty}
-            </span>
-          </div>
+          <div className="flex items-center justify-between gap-2 p-3 bg-slate-900/60 border border-slate-800 rounded-2xl">
+            <div className="flex items-center gap-1.5 overflow-x-auto py-1">
+              {questions.map((_, qIdx) => {
+                const isAnswered = selectedAnswers[qIdx] !== undefined;
+                const isCurrent = currentIdx === qIdx;
+                const isFlagged = flaggedQuestions[qIdx];
+                return (
+                  <button
+                    key={qIdx}
+                    onClick={() => setCurrentIdx(qIdx)}
+                    className={`w-8 h-8 rounded-lg text-xs font-mono font-bold transition-all relative ${
+                      isCurrent
+                        ? "bg-cyan-500 text-slate-950 ring-2 ring-cyan-400/40"
+                        : isAnswered
+                        ? "bg-emerald-950 text-emerald-300 border border-emerald-800"
+                        : "bg-slate-800/80 text-slate-400 hover:bg-slate-700 border border-slate-700/60"
+                    }`}
+                  >
+                    {qIdx + 1}
+                    {isFlagged && (
+                      <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-amber-400" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
 
-          <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-            <div className="bg-gradient-to-r from-cyan-500 to-emerald-400 h-1.5 rounded-full transition-all duration-300"
-                 style={{ width: `${((currentIdx + 1) / questions.length) * 100}%` }} />
+            <button
+              onClick={() => toggleFlag(currentIdx)}
+              title="Flag question for review"
+              className={`p-2 rounded-xl border text-xs flex items-center gap-1.5 transition-colors ${
+                flaggedQuestions[currentIdx]
+                  ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
+                  : "bg-slate-900 text-slate-400 border-slate-800 hover:text-white"
+              }`}
+            >
+              <BookmarkIcon className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">{flaggedQuestions[currentIdx] ? "Flagged" : "Flag"}</span>
+            </button>
           </div>
 
           <div className="border border-slate-800 bg-[#090d18] rounded-2xl p-6 space-y-5">
+            <div className="flex items-center justify-between text-xs text-slate-400">
+              <span className="font-mono">Question <strong className="text-white">{currentIdx + 1}</strong> of 10</span>
+              <span className="text-[10px] font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-800/60 px-2 py-0.5 rounded uppercase">
+                {selectedTech} • {difficulty}
+              </span>
+            </div>
+
             <h2 className="text-base font-bold text-white leading-relaxed">{currentIdx + 1}. {currentQ.q}</h2>
+            
+            {currentQ.code && (
+              <div className="p-3.5 bg-[#05070d] rounded-xl border border-slate-800 font-mono text-[11px] text-emerald-300 overflow-x-auto">
+                <pre>{currentQ.code}</pre>
+              </div>
+            )}
+
             <div className="space-y-2.5">
               {currentQ.options?.map((option, optIdx) => {
                 const isSelected = selectedAnswers[currentIdx] === optIdx;
@@ -1109,28 +1419,35 @@ Return pure JSON array matching:
             <div className="flex items-center gap-5">
               <div className="w-16 h-16 rounded-2xl bg-cyan-950/80 border border-cyan-800/80 flex flex-col items-center justify-center shrink-0">
                 <span className="text-2xl font-black text-cyan-300">{score}</span>
-                <span className="text-[10px] text-slate-400 font-mono">/ {questions.length}</span>
+                <span className="text-[10px] text-slate-400 font-mono">/ 10</span>
               </div>
               <div>
                 <h3 className="text-base font-bold text-white">
-                  {score >= 8 ? `${selectedTech} Benchmark Cleared (+6 Readiness!)` : "Sprint Logged (+4 Readiness)"}
+                  {score >= 8 ? `${selectedTech} Benchmark Cleared (+6 Readiness!)` : "Sprint Completed (+4 Readiness)"}
                 </h3>
-                <p className="text-xs text-slate-400 mt-1">Activity added to your Deliberate Practice streak.</p>
+                <p className="text-xs text-slate-400 mt-1">Accuracy: {score * 10}%. Added to your daily practice streak.</p>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
               <button
-                onClick={() => { setSelectedAnswers({}); setIsSubmitted(false); setCurrentIdx(0); }}
+                onClick={copyResults}
+                className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-300 rounded-xl transition-colors flex items-center gap-1.5"
+              >
+                <CopyIcon className="w-3.5 h-3.5" />
+                {copiedSummary ? "Copied!" : "Share Results"}
+              </button>
+              <button
+                onClick={() => { setSelectedAnswers({}); setFlaggedQuestions({}); setIsSubmitted(false); setCurrentIdx(0); }}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-white rounded-xl transition-colors"
               >
-                Retake This Batch
+                Retake
               </button>
               <button
                 onClick={handleLoadNextTenQuestions}
                 className="px-5 py-2 bg-gradient-to-r from-cyan-500 to-emerald-400 hover:opacity-90 text-slate-950 font-extrabold text-xs rounded-xl transition-all shadow-lg shadow-cyan-950/50 flex items-center gap-1.5"
               >
-                Practice 10 New Questions <RefreshCwIcon className="w-3.5 h-3.5"/>
+                Practice 10 New Qs <RefreshCwIcon className="w-3.5 h-3.5"/>
               </button>
             </div>
           </div>
@@ -1256,7 +1573,7 @@ Return pure JSON:
         <textarea
           value={draftText}
           onChange={e => setDraftText(e.target.value)}
-          placeholder="e.g. In my previous project, we faced a major outage during migration. I led the troubleshooting..."
+          placeholder="e.g. In my previous project, we faced a major latency spike during database failover..."
           rows="4"
           className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
         />
@@ -1379,7 +1696,7 @@ Evaluate strictly. If ungrounded or lacking metrics, mark isFluff=true, give sco
 }`
           }]
         }],
-        "You are a ruthless Staff Interviewer. Output valid JSON only.",
+        "You are a rigorous Staff Interviewer. Output valid JSON only.",
         true
       );
 
@@ -1395,8 +1712,8 @@ Evaluate strictly. If ungrounded or lacking metrics, mark isFluff=true, give sco
       setMessages([...newMsgs, {
         role: "ai",
         badge: true,
-        score: 2,
-        text: "That doesn't answer the question. You need quantitative trade-off metrics. Re-format your answer using the STAR method."
+        score: 3,
+        text: "That explanation lacks production metrics. Specify the exact profiling tools, throughput change, and error rate impact."
       }]);
       onCompleteSprint("defender", 2);
     } finally {
@@ -1688,7 +2005,7 @@ Return JSON:
   );
 }
 
-/* ---------- 8. Auth Modal Component ---------- */
+/* ---------- 8. Auth & API Key Modals ---------- */
 function AuthModal({ isOpen, onClose, onGoogleSignIn, onGuestSignIn }) {
   if (!isOpen) return null;
   return (
@@ -1732,61 +2049,120 @@ function AuthModal({ isOpen, onClose, onGoogleSignIn, onGuestSignIn }) {
   );
 }
 
-/* ---------- Master App Controller (State & Persistence Engine) ---------- */
+function ApiKeyModal({ isOpen, onClose }) {
+  const [keyInput, setKeyInput] = useState(localStorage.getItem("prepstack_custom_gemini_key") || "");
+  const [savedSuccess, setSavedSuccess] = useState(false);
+
+  if (!isOpen) return null;
+
+  const handleSave = () => {
+    if (keyInput.trim()) {
+      localStorage.setItem("prepstack_custom_gemini_key", keyInput.trim());
+    } else {
+      localStorage.removeItem("prepstack_custom_gemini_key");
+    }
+    setSavedSuccess(true);
+    setTimeout(() => {
+      setSavedSuccess(false);
+      onClose();
+    }, 1200);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="max-w-md w-full bg-[#090d18] border border-slate-800 rounded-2xl p-6 space-y-4 rise shadow-2xl">
+        <div className="text-center">
+          <div className="w-10 h-10 rounded-xl bg-cyan-950 border border-cyan-800 flex items-center justify-center mx-auto text-cyan-400 mb-2">
+            <KeyIcon className="w-5 h-5"/>
+          </div>
+          <h3 className="text-base font-bold text-white">Gemini API Key Configuration</h3>
+          <p className="text-xs text-slate-400 mt-1">Configure your Google AI Studio API key. Saved securely in your browser's local storage.</p>
+        </div>
+
+        <div className="space-y-3">
+          <input
+            type="password"
+            value={keyInput}
+            onChange={e => setKeyInput(e.target.value)}
+            placeholder="AIzaSy... (leave blank to use default key)"
+            className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+          />
+          <div className="text-[11px] text-slate-500 leading-relaxed">
+            Get your key from <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-cyan-400 underline">Google AI Studio</a>.
+          </div>
+        </div>
+
+        <div className="flex gap-2 pt-2">
+          <button onClick={onClose} className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 rounded-xl border border-slate-700">
+            Cancel
+          </button>
+          <button onClick={handleSave} className="flex-1 py-2 bg-cyan-500 hover:bg-cyan-400 text-xs font-bold text-slate-950 rounded-xl">
+            {savedSuccess ? "Saved!" : "Save Key"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Master App Controller ---------- */
 function App() {
   const [view, setView] = useState("onboarding");
   const [analysis, setAnalysis] = useState(DEFAULT_PERSONAS[0]);
   const [user, setUser] = useState(null);
   const [isAuthOpen, setIsAuthOpen] = useState(false);
+  const [isApiKeyOpen, setIsApiKeyOpen] = useState(false);
 
-  // Live Functional Metrics
-  const [readinessScore, setReadinessScore] = useState(64);
+  const [readinessScore, setReadinessScore] = useState(68);
   const [activityLog, setActivityLog] = useState({});
   const [currentStreak, setCurrentStreak] = useState(1);
 
-  // Load local or Firebase session on mount
   useEffect(() => {
     const savedLog = localStorage.getItem("prepstack_activity_log");
     const savedScore = localStorage.getItem("prepstack_readiness_score");
+    const savedAnalysis = localStorage.getItem("prepstack_analysis_data");
+
     if (savedLog) {
       try { setActivityLog(JSON.parse(savedLog)); } catch (e) {}
     }
     if (savedScore) {
       setReadinessScore(Number(savedScore));
     }
+    if (savedAnalysis) {
+      try {
+        const parsed = JSON.parse(savedAnalysis);
+        setAnalysis(normalizeAnalysis(parsed));
+      } catch (e) {}
+    }
 
-    // Firebase Auth Listener
-    const unsubscribe = auth.onAuthStateChanged(async (currentUser) => {
-      setUser(currentUser);
-      if (currentUser) {
-        try {
-          const docRef = db.collection("users").doc(currentUser.uid);
-          const doc = await docRef.get();
-          if (doc.exists) {
-            const data = doc.data();
-            if (data.readinessScore) setReadinessScore(data.readinessScore);
-            if (data.activityLog) setActivityLog(data.activityLog);
-            if (data.analysis) setAnalysis(normalizeAnalysis(data.analysis));
+    if (auth) {
+      const unsubscribe = auth.onAuthStateChanged(async (currentUser) => {
+        setUser(currentUser);
+        if (currentUser && db) {
+          try {
+            const docRef = db.collection("users").doc(currentUser.uid);
+            const doc = await docRef.get();
+            if (doc.exists) {
+              const data = doc.data();
+              if (data.readinessScore) setReadinessScore(data.readinessScore);
+              if (data.activityLog) setActivityLog(data.activityLog);
+              if (data.analysis) setAnalysis(normalizeAnalysis(data.analysis));
+            }
+          } catch (e) {
+            console.warn("Firestore sync notice:", e);
           }
-        } catch (e) {
-          console.warn("Firestore sync notice:", e);
         }
-      }
-    });
-
-    return () => unsubscribe();
+      });
+      return () => unsubscribe();
+    }
   }, []);
 
-  // Calculate Streak whenever activityLog changes
   useEffect(() => {
     let streak = 0;
-    const today = new Date();
     const todayStr = getTodayString();
     
-    // Check if today was done
     let d = new Date();
     if (!activityLog[todayStr]) {
-      // Check if yesterday was done
       d.setDate(d.getDate() - 1);
     }
 
@@ -1802,7 +2178,6 @@ function App() {
     setCurrentStreak(Math.max(1, streak));
   }, [activityLog]);
 
-  // Unified Functional Activity Recorder
   const handleCompleteSprint = (sprintType, pointsEarned = 3) => {
     const todayStr = getTodayString();
     const updatedCount = (activityLog[todayStr] || 0) + 1;
@@ -1815,8 +2190,7 @@ function App() {
     localStorage.setItem("prepstack_activity_log", JSON.stringify(updatedLog));
     localStorage.setItem("prepstack_readiness_score", String(newScore));
 
-    // Persist to Cloud Firestore if logged in
-    if (user) {
+    if (user && db) {
       try {
         db.collection("users").doc(user.uid).set({
           readinessScore: newScore,
@@ -1832,15 +2206,24 @@ function App() {
     const norm = normalizeAnalysis(data);
     setAnalysis(norm);
     setReadinessScore(norm.readinessScore);
+    localStorage.setItem("prepstack_analysis_data", JSON.stringify(norm));
     setView("dashboard");
     handleCompleteSprint("onboarding", 2);
   };
 
   const handleGoogleSignIn = async () => {
     try {
-      const provider = new firebase.auth.GoogleAuthProvider();
-      await auth.signInWithPopup(provider);
-      setIsAuthOpen(false);
+      if (auth) {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        await auth.signInWithPopup(provider);
+        setIsAuthOpen(false);
+      } else {
+        handleGuestSignIn();
+      }
+    } catch (e) {
+      handleGuest} else {
+        handleGuestSignIn();
+      }
     } catch (e) {
       handleGuestSignIn();
     }
@@ -1849,7 +2232,7 @@ function App() {
   const handleGuestSignIn = () => {
     const mockUser = {
       uid: "guest_" + Date.now(),
-      displayName: analysis.name || "Software Specialist",
+      displayName: analysis.name || "Aryan Mani",
       email: "engineer@prepstack.dev"
     };
     setUser(mockUser);
@@ -1857,7 +2240,7 @@ function App() {
   };
 
   const handleSignOut = async () => {
-    try { await auth.signOut(); } catch (e) {}
+    try { if (auth) await auth.signOut(); } catch (e) {}
     setUser(null);
   };
 
@@ -1870,8 +2253,13 @@ function App() {
         onGuestSignIn={handleGuestSignIn}
       />
 
+      <ApiKeyModal
+        isOpen={isApiKeyOpen}
+        onClose={() => setIsApiKeyOpen(false)}
+      />
+
       {view === "onboarding" ? (
-        <Onboarding onComplete={handleOnboardingComplete} />
+        <Onboarding onComplete={handleOnboardingComplete} onOpenApiKeyModal={() => setIsApiKeyOpen(true)} />
       ) : (
         <Shell
           active={view}
@@ -1881,6 +2269,7 @@ function App() {
           user={user}
           onSignIn={() => setIsAuthOpen(true)}
           onSignOut={handleSignOut}
+          onOpenApiKeyModal={() => setIsApiKeyOpen(true)}
         >
           {view === "dashboard" && (
             <Dashboard
